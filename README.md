@@ -18,10 +18,20 @@ python3 app.py --db organ_allocation.db
 - `GET /api/donors/{id}/ranking`：查看兼容候选排序。
 - `POST /api/allocations`：提出唯一分配。
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
-- `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
-- `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
+- `POST /api/allocations/{id}/transit`、`delay`：冷链转运（进入转运时生成随机封签码）和延误上报。
+- `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认；双方都必须在请求体上报 `seal_code` 并与转运封签核验一致。
+- `POST /api/allocations/{id}/seal-supplement`：已有转运中分配缺封签时，由分配员补录随机封签。
 - `POST /api/allocations/{id}/implant`：确认植入。
-- `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+- `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图（`seal_board` 给出缺封签待补与核验差异清单）。
+
+## 封签交接
+
+- 转运开始（`transit`）后系统生成形如 `SEAL-XXXXXXXXXX` 的随机一次性封签码，随分配返回（`seal_code`）。
+- 来源医院 `handoff` 与接收医院 `handoff-accept` 都必须上报同一封签：码不一致返回 `seal_mismatch`，封签在其他分配已使用返回 `seal_duplicate`；交接不得完成，原分配继续停在 `in_transit`。
+- 双方上报的封签、医院、人员、核验结论与时刻写入 `seal_verifications`，拒绝记录同样留痕；分配视图的 `seal` 字段汇总双方最新结论（`matched/mismatch/duplicate/expired`）。
+- 器官过期后的核验只产生拒绝记录（结论 `expired`），分配落为 `expired`，绝不记为 `handed_off`。
+- 判定规则集中在 `seals.py`（纯函数），持久化在 `app.py`，页面交互在 `static/index.html`，三者分开维护。
+
 
 ## 测试
 

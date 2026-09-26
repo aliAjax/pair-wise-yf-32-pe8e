@@ -1,3 +1,94 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;background:#f5f7fb;padding:0 20px;color:#172033}
+section{background:white;padding:18px 20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:18px}
+input,button,select{font:inherit;padding:7px 9px;margin:3px}
+button{background:#be123c;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#475569}button:disabled{background:#cbd5e1;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #e2e8f0;padding:7px 8px;text-align:left;vertical-align:top}
+th{background:#f8fafc}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;color:white}
+.s-absent{background:#94a3b8}.s-pending{background:#d97706}.s-sealed{background:#2563eb}
+.s-verified{background:#16a34a}.r-mismatch{background:#dc2626}.r-duplicate{background:#b91c1c}.r-expired{background:#7c2d12}
+.warn{background:#fef2f2;border:1px solid #fecaca}.ok{color:#16a34a}.muted{color:#64748b}
+h2{font-size:17px;margin:0 0 10px}.mono{font-family:ui-monospace,monospace}
+</style>
+<h1>器官分配协调台</h1>
+<p>转运开始后系统生成随机封签；来源医院发起、接收医院确认都必须核验同一封签。码不一致或封签重复则交接不能完成，双方上报的封签与时刻均留痕。本页只做展示与操作，核验判定由服务端完成。</p>
+<section>
+  身份 <input id="u" value="allocator" style="width:130px">
+  <select id="r">
+    <option value="allocation_officer">分配员</option><option value="coordinator">协调员</option>
+    <option value="hospital">医院</option><option value="auditor">审计员</option><option value="viewer">访客</option>
+  </select>
+  医院 <input id="h" value="" placeholder="H1 / H2" style="width:110px">
+  <button onclick="load()">刷新</button> <span id="clock" class="muted"></span>
+  <div id="msg"></div>
+</section>
+<section class="warn" id="pendingSec" style="display:none">
+  <h2>⏳ 缺封签待补（转运中）</h2><div id="pending"></div>
+</section>
+<section class="warn" id="diffSec" style="display:none">
+  <h2>⚠️ 封签差异（不一致 / 重复 / 过期拒绝）</h2><div id="diff"></div>
+</section>
+<section>
+  <h2>分配与封签进度</h2><div id="allocations"></div>
+</section>
+<script>
+const STAGE_LABEL={departure:'来源发起',arrival:'接收确认'};
+const RESULT_LABEL={matched:'一致',mismatch:'码不一致',duplicate:'封签重复',expired:'器官过期'};
+const STATE_LABEL={absent:'未转运',pending:'缺封签待补',sealed:'封签已生成',verified:'双方核验通过'};
+function headers(){return {'X-User-Id':u.value,'X-Role':r.value,'X-Hospital':h.value,'Content-Type':'application/json'}}
+async function api(path,method='GET',body){
+  const opt={method,headers:headers()}; if(body)opt.body=JSON.stringify(body);
+  const res=await fetch(path,opt),data=await res.json();
+  if(!res.ok)throw Object.assign(new Error(data.message||res.statusText),{code:data.error});
+  return data;
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function badge(cls,t){return `<span class="badge ${cls}">${esc(t)}</span>`}
+function sealState(s){return s?badge('s-'+s.state,STATE_LABEL[s.state]||s.state):'<span class="muted">—</span>'}
+function rejectionRow(r){return `<tr><td>#${r.id}</td><td>${esc(STAGE_LABEL[r.stage]||r.stage)}</td>
+  <td>${esc(r.hospital)}/${esc(r.actor)}</td><td class="mono">${esc(r.reported_seal)}</td>
+  <td>${badge('r-'+r.result,RESULT_LABEL[r.result]||r.result)}</td><td class="muted">${esc(r.created_at)}</td></tr>`}
+function rejectionsTable(list){
+  if(!list||!list.length)return '<span class="ok">无</span>';
+  return `<table><tr><th>记录</th><th>环节</th><th>上报方</th><th>上报封签</th><th>结论</th><th>时刻</th></tr>${list.map(rejectionRow).join('')}</table>`;
+}
+async function supplement(id){
+  try{await api(`/api/allocations/${id}/seal-supplement`,'POST',{});msg('ok',`#${id} 封签已补录`);load()}
+  catch(e){msg('err',`补录失败：${e.message}`)}
+}
+function msg(kind,text){document.getElementById('msg').innerHTML=`<p class="${kind==='ok'?'ok':''}" style="color:${kind==='ok'?'#16a34a':'#dc2626'}">${esc(text)}</p>`}
+function renderPending(items){
+  pendingSec.style.display=items.length?'block':'none';
+  pending.innerHTML=items.length?`<table><tr><th>分配</th><th>路线</th><th>状态</th><th>更新时间</th><th></th></tr>${items.map(x=>
+    `<tr><td>#${x.allocation_id}</td><td>${esc(x.route)}</td><td>${esc(x.status)}</td><td class="muted">${esc(x.updated_at)}</td>
+    <td><button onclick="supplement(${x.allocation_id})">补录随机封签</button></td></tr>`).join('')}</table>`:'';
+}
+function renderDiff(items){
+  diffSec.style.display=items.length?'block':'none';
+  diff.innerHTML=items.length?items.map(x=>
+    `<p>分配 <b>#${x.allocation_id}</b> ${esc(x.route)} · 当前 ${esc(x.status)} · ${sealState({state:x.state})}</p>${rejectionsTable(x.rejections)}`).join(''):'';
+}
+function renderAllocations(items){
+  if(!items.length){allocations.innerHTML='<p class="muted">无分配数据。</p>';return}
+  allocations.innerHTML=`<table><tr><th>#</th><th>状态</th><th>封签</th><th>来源上报</th><th>接收上报</th><th>更新时间</th></tr>${items.map(a=>{
+    const s=a.seal;
+    if(!s)return `<tr><td>#${a.id}</td><td>${esc(a.status)}</td><td colspan="4" class="muted">访客视图不显示封签</td></tr>`;
+    const v=x=>x?`${badge('r-'+(x.result==='matched'?'matched':x.result),RESULT_LABEL[x.result]||x.result)} <span class="mono">${esc(x.reported_seal)}</span><br><span class="muted">${esc(x.created_at)} · ${esc(x.hospital)}</span>`:'<span class="muted">未上报</span>';
+    return `<tr><td>#${a.id}</td><td>${esc(a.status)}</td><td>${sealState(s)}<br><span class="mono">${esc(s.seal_code||'—')}</span>${s.discrepancy?'<br>⚠️ 有差异记录':''}</td>
+    <td>${v(s.departure)}</td><td>${v(s.arrival)}</td><td class="muted">${esc(a.updated_at)}</td></tr>`;
+  }).join('')}</table>`;
+}
+async function load(){
+  try{
+    const data=await api('/api/state');
+    clock.textContent='服务器时间 '+data.server_time;
+    renderPending(data.seal_board?data.seal_board.pending:[]);
+    renderDiff(data.seal_board?data.seal_board.discrepancies:[]);
+    renderAllocations(data.allocations||[]);
+  }catch(e){msg('err','加载失败：'+e.message)}
+}
+load();
+</script>
