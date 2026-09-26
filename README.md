@@ -18,10 +18,19 @@ python3 app.py --db organ_allocation.db
 - `GET /api/donors/{id}/ranking`：查看兼容候选排序。
 - `POST /api/allocations`：提出唯一分配。
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
-- `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
-- `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
+- `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报；转运开始时生成随机封签码。
+- `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认，双方必须上报同一 `seal_code`。
+- `POST /api/allocations/{id}/seal`：为缺封签的在途分配补发封签（仅分配员，已有封签不可替换）。
 - `POST /api/allocations/{id}/implant`：确认植入。
-- `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+- `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图；协调角色的 state 含 `seal_issues` 差异列表。
+
+## 封签核验
+
+- 转运开始自动生成 8 位随机封签码，与仍在流转的封签不重复。
+- 发起交接与确认交接都核验同一封签：不一致（`seal_mismatch`）、撞上其他在途分配的封签（`seal_duplicate`，疑似容器调换）或本单缺封签（`seal_missing`）时交接不得完成，分配保持 `in_transit`；双方上报的封签与时刻保存在 `handoffs` 与 `seal_events`。
+- 器官过期后的核验只留 `expired` 拒绝记录，分配转入 `expired`，不会记为已交接。
+- 协调台展示封签差异；历史在途分配缺封签时显示“待补”，补发后方可交接。
+- 判定（`seal_policy.py`）、记录（`seal_log.py`）与页面交互（`static/index.html`）分层维护。
 
 ## 测试
 

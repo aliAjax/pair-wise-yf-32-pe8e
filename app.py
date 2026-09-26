@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from seal_log import SealLedger, ensure_schema as ensure_seal_schema
+from seal_policy import generate_seal, normalize_seal, verify_seal
+
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
@@ -74,6 +77,7 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        ensure_seal_schema(self.conn)
 
     @contextmanager
     def tx(self):
@@ -187,6 +191,7 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        result["seal_events"] = SealLedger.events(conn, allocation_id)
         return result
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
@@ -200,6 +205,23 @@ class OrganAllocationService:
             Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_expired", {"reason": "organ_window_elapsed"})
             raise ApiError(409, "organ_expired", "器官已经超过可用时间，禁止继续流转")
         return row
+
+    def _seal_guard(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str, hospital: str, stage: str, reported_seal: str | None) -> tuple[sqlite3.Row, ApiError | None]:
+        """交接封签前置检查。器官已过期时写入拒绝记录并返回待抛错误（调用方在事务提交后再抛），保证过期核验只留拒绝记录、不会记为已交接。"""
+        row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+        if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
+        if row["status"] in {"withdrawn", "implanted"}: raise ApiError(409, "allocation_closed", "分配已结束")
+        donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+        if row["status"] != "expired" and parse_time(donor["expires_at"]) > utcnow(): return row, None
+        now = iso()
+        if row["status"] != "expired":
+            conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (now, allocation_id))
+            conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor["id"],))
+            Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_expired", {"reason": "organ_window_elapsed"})
+        SealLedger.record(conn, allocation_id=allocation_id, handoff_id=None, stage=stage, actor=actor, hospital=hospital,
+                          expected_seal=row["seal_code"], reported_seal=reported_seal, result="expired", detail="器官已过可用窗口，核验拒绝", created_at=now)
+        Repository.audit(conn, allocation_id, donor["id"], actor, role, "seal_rejected", {"stage": stage, "result": "expired", "reported_seal": reported_seal})
+        return row, ApiError(409, "organ_expired", "器官已过可用窗口，交接核验仅保留拒绝记录")
 
     def accept(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "hospital_required", "只有接收医院可以接受器官")
@@ -224,8 +246,11 @@ class OrganAllocationService:
         with self.repo.tx() as conn:
             row = self._ensure_active(conn, allocation_id, actor, role)
             if row["status"] != "accepted": raise ApiError(409, "invalid_transition", "只有已接受分配可以进入转运")
-            conn.execute("UPDATE allocations SET status='in_transit',cold_chain_temp=?,revision=revision+1,updated_at=? WHERE id=?", (float(temp), iso(), allocation_id))
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "transfer_started", {"cold_chain_temp": temp})
+            seal = generate_seal(SealLedger.active_seals(conn)); now = iso()
+            conn.execute("UPDATE allocations SET status='in_transit',cold_chain_temp=?,seal_code=?,seal_issued_at=?,revision=revision+1,updated_at=? WHERE id=?", (float(temp), seal, now, now, allocation_id))
+            SealLedger.record(conn, allocation_id=allocation_id, handoff_id=None, stage="issue", actor=actor, hospital="",
+                              expected_seal=seal, reported_seal=seal, result="issued", detail="转运开始生成封签", created_at=now)
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "transfer_started", {"cold_chain_temp": temp, "seal_code": seal})
             return self._allocation(conn, allocation_id, role, "")
 
     def report_delay(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -243,34 +268,78 @@ class OrganAllocationService:
         expected = body.get("expected_revision"); target = str(body.get("to_hospital", "")).strip(); temp = body.get("cold_chain_temp")
         if not isinstance(expected, int) or not target or not isinstance(temp, (int, float)) or not -2 <= float(temp) <= 8:
             raise ApiError(400, "invalid_handoff", "expected_revision、to_hospital 和合规冷链温度必填")
+        seal = normalize_seal(body.get("seal_code"))
+        if not seal: raise ApiError(400, "seal_required", "必须上报容器封签码")
+        pending: ApiError | None = None; result: dict[str, Any] | None = None
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
-            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
-            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
-            if hospital != donor["hospital"]: raise ApiError(403, "wrong_hospital", "只能由器官来源医院发起交接")
-            if target != candidate["hospital"]: raise ApiError(409, "wrong_destination", "交接目标必须与候选患者医院一致")
-            if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中分配可以交接")
-            if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配版本已变化")
-            try:
-                cur = conn.execute("""INSERT INTO handoffs(allocation_id,from_hospital,to_hospital,cold_chain_temp,initiated_by,initiated_at)
-                                      VALUES(?,?,?,?,?,?)""", (allocation_id, hospital, target, float(temp), actor, iso()))
-            except sqlite3.IntegrityError as exc:
-                raise ApiError(409, "handoff_exists", "交接已经登记") from exc
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_initiated", {"target": target, "cold_chain_temp": temp})
-            return {"handoff": dict(conn.execute("SELECT * FROM handoffs WHERE id=?", (cur.lastrowid,)).fetchone()), "allocation": self._allocation(conn, allocation_id, role, hospital)}
+            row, pending = self._seal_guard(conn, allocation_id, actor, role, hospital, "initiate", seal)
+            if pending is None:
+                donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+                candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+                if hospital != donor["hospital"]: raise ApiError(403, "wrong_hospital", "只能由器官来源医院发起交接")
+                if target != candidate["hospital"]: raise ApiError(409, "wrong_destination", "交接目标必须与候选患者医院一致")
+                if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中分配可以交接")
+                if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配版本已变化")
+                if conn.execute("SELECT 1 FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone():
+                    raise ApiError(409, "handoff_exists", "交接已经登记")
+                verdict = verify_seal(row["seal_code"], seal, SealLedger.active_seals(conn, allocation_id))
+                now = iso()
+                SealLedger.record(conn, allocation_id=allocation_id, handoff_id=None, stage="initiate", actor=actor, hospital=hospital,
+                                  expected_seal=row["seal_code"], reported_seal=seal, result=verdict.result, detail=verdict.message, created_at=now)
+                if not verdict.ok:
+                    Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "seal_rejected", {"stage": "initiate", "result": verdict.result, "reported_seal": seal})
+                    pending = ApiError(409, f"seal_{verdict.result}", verdict.message)
+                else:
+                    cur = conn.execute("""INSERT INTO handoffs(allocation_id,from_hospital,to_hospital,cold_chain_temp,initiator_seal,initiated_by,initiated_at)
+                                          VALUES(?,?,?,?,?,?,?)""", (allocation_id, hospital, target, float(temp), seal, actor, now))
+                    Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_initiated", {"target": target, "cold_chain_temp": temp, "seal_code": seal})
+                    result = {"handoff": dict(conn.execute("SELECT * FROM handoffs WHERE id=?", (cur.lastrowid,)).fetchone()), "allocation": self._allocation(conn, allocation_id, role, hospital)}
+        if pending: raise pending
+        return result
 
     def accept_handoff(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "handoff_forbidden", "只有医院可以确认交接")
+        seal = normalize_seal(body.get("seal_code"))
+        pending: ApiError | None = None; result: dict[str, Any] | None = None
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
-            handoff = conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone()
-            if not handoff: raise ApiError(409, "handoff_missing", "尚未发起交接")
-            if handoff["to_hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由接收医院确认交接")
-            if handoff["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
-            conn.execute("UPDATE handoffs SET status='accepted',accepted_by=?,accepted_at=? WHERE id=?", (actor, iso(), handoff["id"]))
-            conn.execute("UPDATE allocations SET status='handed_off',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", {"handoff_id": handoff["id"]})
-            return self._allocation(conn, allocation_id, role, hospital)
+            row, pending = self._seal_guard(conn, allocation_id, actor, role, hospital, "confirm", seal)
+            if pending is None:
+                handoff = conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone()
+                if not handoff: raise ApiError(409, "handoff_missing", "尚未发起交接")
+                if handoff["to_hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由接收医院确认交接")
+                if handoff["status"] == "accepted":
+                    result = self._allocation(conn, allocation_id, role, hospital)
+                else:
+                    if not seal: raise ApiError(400, "seal_required", "必须上报容器封签码")
+                    verdict = verify_seal(row["seal_code"], seal, SealLedger.active_seals(conn, allocation_id))
+                    now = iso()
+                    conn.execute("UPDATE handoffs SET receiver_seal=?,receiver_reported_at=? WHERE id=?", (seal, now, handoff["id"]))
+                    SealLedger.record(conn, allocation_id=allocation_id, handoff_id=handoff["id"], stage="confirm", actor=actor, hospital=hospital,
+                                      expected_seal=row["seal_code"], reported_seal=seal, result=verdict.result, detail=verdict.message, created_at=now)
+                    if not verdict.ok:
+                        Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "seal_rejected", {"stage": "confirm", "result": verdict.result, "reported_seal": seal})
+                        pending = ApiError(409, f"seal_{verdict.result}", verdict.message)
+                    else:
+                        conn.execute("UPDATE handoffs SET status='accepted',accepted_by=?,accepted_at=? WHERE id=?", (actor, now, handoff["id"]))
+                        conn.execute("UPDATE allocations SET status='handed_off',revision=revision+1,updated_at=? WHERE id=?", (now, allocation_id))
+                        Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", {"handoff_id": handoff["id"], "seal_code": seal})
+                        result = self._allocation(conn, allocation_id, role, hospital)
+        if pending: raise pending
+        return result
+
+    def supplement_seal(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "allocation_officer": raise ApiError(403, "seal_forbidden", "只有分配员可以补发封签")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+            if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
+            if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中分配可以补发封签")
+            if row["seal_code"]: raise ApiError(409, "seal_exists", "封签已生成，不能替换")
+            seal = generate_seal(SealLedger.active_seals(conn)); now = iso()
+            conn.execute("UPDATE allocations SET seal_code=?,seal_issued_at=?,revision=revision+1,updated_at=? WHERE id=?", (seal, now, now, allocation_id))
+            SealLedger.record(conn, allocation_id=allocation_id, handoff_id=None, stage="issue", actor=actor, hospital="",
+                              expected_seal=seal, reported_seal=seal, result="issued", detail="补发封签", created_at=now)
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "seal_supplemented", {"seal_code": seal})
+            return self._allocation(conn, allocation_id, role, "")
 
     def implant(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "allocation_officer": raise ApiError(403, "implant_forbidden", "只有分配员可以确认植入")
@@ -319,7 +388,10 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
-        return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+        result = {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+        if role in {"coordinator", "allocation_officer", "auditor"}:
+            result["seal_issues"] = SealLedger.discrepancies(conn)
+        return result
 
 
 def json_reply(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -362,6 +434,7 @@ class Handler(BaseHTTPRequestHandler):
                 "delay": lambda: self.service.report_delay(aid, actor, role, body),
                 "handoff": lambda: self.service.initiate_handoff(aid, actor, role, hospital, body),
                 "handoff-accept": lambda: self.service.accept_handoff(aid, actor, role, hospital, body),
+                "seal": lambda: self.service.supplement_seal(aid, actor, role, body),
                 "implant": lambda: self.service.implant(aid, actor, role, body),
             }
             if action in routes: return 200, routes[action]()
